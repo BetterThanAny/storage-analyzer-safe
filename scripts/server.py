@@ -164,15 +164,17 @@ def _trash_windows(path):
 
     FO_DELETE = 3
     FOF_ALLOWUNDO = 0x0040
-    FOF_NOCONFIRMATION = 0x0010
-    FOF_SILENT = 0x0004
+    FOF_NOCONFIRMATION = 0x0010    # 送回收站时不弹确认，正常流程不打扰
+    FOF_WANTNUKEWARNING = 0x4000   # 但无法送回收站、要永久删除时仍弹警告，杜绝静默 nuke
     op = SHFILEOPSTRUCTW()
     op.wFunc = FO_DELETE
     op.pFrom = os.path.abspath(path) + "\x00\x00"  # double-null terminated list
-    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT
+    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_WANTNUKEWARNING
     rc = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
     if rc != 0:
         raise OSError("SHFileOperation failed (code %d)" % rc)
+    if op.fAnyOperationsAborted:
+        raise OSError("操作已取消：该文件可能无法移入回收站")
 
 
 def open_in_file_manager(path):
@@ -228,13 +230,20 @@ class Handler(BaseHTTPRequestHandler):
         if host not in ("127.0.0.1", "localhost"):
             self._send(403, json.dumps({"ok": False, "error": "host 不被允许"}))
             return
-        n = int(self.headers.get("Content-Length", 0))
+        try:
+            n = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            self._send(400, json.dumps({"ok": False, "error": "请求格式错误"}))
+            return
+        if n < 0 or n > (1 << 20):  # 1 MiB 上限，挡住超大 Content-Length 拖住线程
+            self._send(413, json.dumps({"ok": False, "error": "请求体过大"}))
+            return
         try:
             req = json.loads(self.rfile.read(n) or b"{}")
         except Exception:
             self._send(400, json.dumps({"ok": False, "error": "请求格式错误"}))
             return
-        if req.get("token") != TOKEN:
+        if not secrets.compare_digest(str(req.get("token") or ""), TOKEN):
             self._send(403, json.dumps({"ok": False, "error": "token 校验失败"}))
             return
         mode = req.get("mode")
