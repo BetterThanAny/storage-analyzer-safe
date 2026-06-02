@@ -26,6 +26,7 @@ import sys
 import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE = os.path.join(HERE, "..", "assets", "report_template.html")
@@ -62,6 +63,30 @@ def under_any(path, roots):
     return False
 
 
+def local_host_from_header(value):
+    host = (value or "").strip().lower()
+    if not host:
+        return ""
+    if host.startswith("["):
+        return host.split("]", 1)[0].lstrip("[")
+    return host.split(":", 1)[0]
+
+
+def is_allowed_local_host(value):
+    return local_host_from_header(value) in ("127.0.0.1", "localhost")
+
+
+def is_allowed_origin(value):
+    if not value:
+        return True
+    parsed = urlparse(value)
+    return parsed.scheme == "http" and parsed.hostname in ("127.0.0.1", "localhost")
+
+
+def is_json_content_type(value):
+    return (value or "").split(";", 1)[0].strip().lower() == "application/json"
+
+
 def open_roots():
     roots = [HOME]
     if sys.platform == "darwin":
@@ -79,13 +104,85 @@ def trash_roots():
 
 
 def protected_trash_paths():
-    names = ("Desktop", "Documents", "Downloads", "Library",
-             "Movies", "Music", "Pictures", "Public")
+    names = ("Desktop", "Documents", "Movies", "Music", "Pictures", "Public")
     return {HOME, *(expand(os.path.join(HOME, name)) for name in names)}
 
 
+def sensitive_trash_roots():
+    names = (
+        ".ssh", ".aws", ".gnupg", ".kube", ".config", ".password-store",
+        "Library/Keychains", "Library/Application Support", "Library/Containers",
+        "Library/Group Containers",
+    )
+    return [expand(os.path.join(HOME, name)) for name in names]
+
+
+def allowed_trash_roots():
+    if sys.platform == "darwin":
+        roots = (
+            "Library/Caches",
+            ".cache",
+            ".npm",
+            ".pnpm-store",
+            ".gradle/caches",
+            ".m2/repository",
+            ".cargo/registry",
+            ".cargo/git",
+            "Library/pnpm",
+            "Library/Developer/Xcode/DerivedData",
+            "Library/Developer/Xcode/iOS DeviceSupport",
+            "Library/Developer/CoreSimulator/Caches",
+            "go/pkg",
+        )
+    elif sys.platform.startswith("win"):
+        local = os.environ.get("LOCALAPPDATA", os.path.join(HOME, "AppData", "Local"))
+        roots = (
+            os.environ.get("TEMP", os.path.join(local, "Temp")),
+            os.path.join(local, "Temp"),
+            os.path.join(local, "pip", "Cache"),
+            os.path.join(local, "Yarn"),
+            os.path.join(local, "uv"),
+            os.path.join(local, "ms-playwright"),
+            os.path.join(local, "go-build"),
+            ".cache",
+            ".npm",
+            ".gradle/caches",
+            ".m2/repository",
+            ".nuget/packages",
+            ".cargo/registry",
+            ".cargo/git",
+        )
+    else:
+        roots = ()
+    return [expand(root if os.path.isabs(root) else os.path.join(HOME, root)) for root in roots]
+
+
+def safe_download_artifact(path):
+    downloads = expand(os.path.join(HOME, "Downloads"))
+    if not under_any(path, [downloads]) or os.path.isdir(path):
+        return False
+    return os.path.splitext(path)[1].lower() in (
+        ".dmg", ".pkg", ".mpkg", ".zip", ".tar", ".gz", ".tgz", ".xz",
+        ".msi", ".exe",
+    )
+
+
 def trash_path_is_safe(path):
-    return under_any(path, trash_roots()) and path not in protected_trash_paths()
+    if not under_any(path, trash_roots()) or path in protected_trash_paths():
+        return False
+    if under_any(path, sensitive_trash_roots()):
+        return False
+    return under_any(path, allowed_trash_roots()) or safe_download_artifact(path)
+
+
+def broad_trash_reject_reason(path):
+    if not under_any(path, trash_roots()):
+        return "路径越界"
+    if path in protected_trash_paths() or under_any(path, sensitive_trash_roots()):
+        return "路径过大或受保护"
+    if not (under_any(path, allowed_trash_roots()) or safe_download_artifact(path)):
+        return "路径不属于允许的缓存或临时位置"
+    return ""
 
 
 def load(src):
@@ -213,6 +310,9 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(b)
 
     def do_GET(self):
+        if not is_allowed_local_host(self.headers.get("Host")):
+            self._send(403, "host 不被允许", "text/plain")
+            return
         if self.path in ("/", "/index.html"):
             blob = safe_json(DATA)
             cfg = safe_json({"token": TOKEN, "endpoint": "/action"})
@@ -226,9 +326,18 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, json.dumps({"ok": False, "error": "not found"}))
             return
         # DNS-rebinding guard: only accept local Host
-        host = (self.headers.get("Host") or "").split(":")[0]
-        if host not in ("127.0.0.1", "localhost"):
+        if not is_allowed_local_host(self.headers.get("Host")):
             self._send(403, json.dumps({"ok": False, "error": "host 不被允许"}))
+            return
+        if not is_allowed_origin(self.headers.get("Origin")):
+            self._send(403, json.dumps({"ok": False, "error": "origin 不被允许"}))
+            return
+        referer = self.headers.get("Referer")
+        if referer and not is_allowed_origin(referer):
+            self._send(403, json.dumps({"ok": False, "error": "referer 不被允许"}))
+            return
+        if not is_json_content_type(self.headers.get("Content-Type")):
+            self._send(415, json.dumps({"ok": False, "error": "仅支持 application/json"}))
             return
         try:
             n = int(self.headers.get("Content-Length", 0))
@@ -263,7 +372,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(403, json.dumps({"ok": False, "error": "路径越界：%s" % p}))
                 return
             if mode == "trash" and not trash_path_is_safe(rp):
-                self._send(403, json.dumps({"ok": False, "error": "路径过大或受保护：%s" % p}))
+                reason = broad_trash_reject_reason(rp) or "路径过大或受保护"
+                self._send(403, json.dumps({"ok": False, "error": "%s：%s" % (reason, p)}))
                 return
             try:
                 if mode == "open":
